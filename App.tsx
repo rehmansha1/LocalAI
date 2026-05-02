@@ -120,8 +120,9 @@ const MODELS = {
     description: 'Understands images + text. Send photos for analysis, OCR, and more.',
     icon: '👁',
     color: '#a78bfa',
-    url: 'https://huggingface.co/xtuner/llava-phi-3-mini-gguf/resolve/main/llava-phi-3-mini-int4.gguf?download=true',
-    mmprojUrl: 'https://huggingface.co/xtuner/llava-phi-3-mini-gguf/resolve/main/llava-phi-3-mini-mmproj-f16.gguf?download=true',
+// swap out the vision model URLs to this well-tested combo:
+url: 'https://huggingface.co/mys/ggml_llava-v1.5-7b/resolve/main/ggml-model-q4_k.gguf',
+mmprojUrl: 'https://huggingface.co/mys/ggml_llava-v1.5-7b/resolve/main/mmproj-model-f16.gguf',
     path: () => `${_modelsDir!}/llava-phi3-mini.gguf`,
     mmprojPath: () => `${_modelsDir!}/llava-phi3-mini-mmproj.gguf`,
     filename: 'llava-phi3-mini.gguf',
@@ -129,7 +130,7 @@ const MODELS = {
     minSize: 800_000_000,
     sizeMB: 1800,
     supportsVision: true,
-    nCtx: 4096,
+    nCtx: 8192,
     nGpuLayers: 0,
     nThreads: 4,
   },
@@ -174,15 +175,16 @@ const buildPrompt = (
   currentImageUri?: string,   // ← add this param
 ): string => {
   if (modelId === 'vision') {
-    let prompt = `<|system|>\n${SYSTEM_PROMPT}<|end|>\n`;
+    // LLaVA 1.5 standard format with explicit instruction
+    let prompt = `A chat between a curious user and an artificial intelligence assistant. The assistant is able to understand images and provide detailed analysis of them. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n`;
     for (const msg of messages.filter(m => !m.pending)) {
-      const role = msg.role === 'user' ? 'user' : 'assistant';
-      // Only inject <image> if this is the message carrying the current image
+      const role = msg.role === 'user' ? 'USER' : 'ASSISTANT';
+      // Place <image> token first if this message has an image
       const isImageMsg = msg.imageUri && msg.imageUri === currentImageUri;
       const content = isImageMsg ? `<image>\n${msg.text}` : msg.text;
-      prompt += `<|${role}|>\n${content}<|end|>\n`;
+      prompt += `${role}: ${content}\n`;
     }
-    prompt += `<|assistant|>\n`;
+    prompt += `ASSISTANT:`;
     return prompt;
   }
   // Llama 3.2 unchanged
@@ -196,7 +198,7 @@ const buildPrompt = (
 };
 const stopTokens = (modelId: ModelId) =>
   modelId === 'vision'
-    ? ['<|end|>', '<|user|>', '<|system|>']
+    ? ['USER:'] // Stop when next user turn begins
     : ['<|eot_id|>', '<|start_header_id|>'];
 
 const ramColor = (pct: number) => {
@@ -258,7 +260,7 @@ const MessageBubble = React.memo(({ message }: { message: Message }) => {
 
 // ─── RAM Badge ────────────────────────────────────────────────────────────────
 
-const RamBadge = ({ used, total, ramFree }: { used: number; total: number, ramFree: number  }) => {
+const RamBadge = ({ used, total, ramFree }: { used: number; total: number, ramFree: number }) => {
   if (total === 0) return null;
   const pct = used / total;
   const color = ramColor(pct);
@@ -269,8 +271,8 @@ const RamBadge = ({ used, total, ramFree }: { used: number; total: number, ramFr
         <View style={[s.ramFill, { width: `${Math.round(pct * 100)}%` as any, backgroundColor: color }]} />
       </View>
       <Text style={[s.ramText, { color }]}>
-         
-  RAM {(used / 1024).toFixed(2)}GB / {(total / 1024).toFixed(1)}GB
+
+        RAM {(used / 1024).toFixed(2)}GB / {(total / 1024).toFixed(1)}GB
       </Text>
     </View>
   );
@@ -479,7 +481,7 @@ export default function App() {
   const [pendingImage, setPendingImage] = useState<string | null>(null);
   const [ramUsed, setRamUsed] = useState(0);
   const [ramTotal, setRamTotal] = useState(0);
-const [ramFree, setRamFree] = useState(0);
+  const [ramFree, setRamFree] = useState(0);
   const llamaRef = useRef<LlamaContext | null>(null);
   const listRef = useRef<FlatList>(null);
   const abortRef = useRef(false);
@@ -491,20 +493,20 @@ const [ramFree, setRamFree] = useState(0);
   // ── RAM polling ───────────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
-const poll = async () => {
-  try {
-    const [used, total] = await Promise.all([
-      DeviceInfo.getUsedMemory(),
-      DeviceInfo.getTotalMemory(),
-    ]);
+    const poll = async () => {
+      try {
+        const [used, total] = await Promise.all([
+          DeviceInfo.getUsedMemory(),
+          DeviceInfo.getTotalMemory(),
+        ]);
 
-    if (mounted) {
-      setRamUsed(used / 1024 / 1024);
-      setRamTotal(total / 1024 / 1024);
-      setRamFree((total - used) / 1024 / 1024);
-    } 
-  } catch (_) {}
-};
+        if (mounted) {
+          setRamUsed(used / 1024 / 1024);
+          setRamTotal(total / 1024 / 1024);
+          setRamFree((total - used) / 1024 / 1024);
+        }
+      } catch (_) { }
+    };
     poll();
     const id = setInterval(poll, 2000);
     return () => { mounted = false; clearInterval(id); };
@@ -660,30 +662,45 @@ const poll = async () => {
 
   // ── Load Model ────────────────────────────────────────────────────────────
 
-  const loadModel = async (modelId: ModelId) => {
-    try {
-      setPhase('loading');
-      llamaRef.current?.release();
-      llamaRef.current = null;
+const loadModel = async (modelId: ModelId) => {
+  try {
+    setPhase('loading');
+    llamaRef.current?.release();
+    llamaRef.current = null;
 
-      const m = MODELS[modelId];
-      const opts: any = {
-        model: m.path(),
-        n_ctx: m.nCtx,
-        n_gpu_layers: m.nGpuLayers,
-        n_threads: m.nThreads,
-      };
-      if (m.supportsVision && 'mmprojPath' in m) {
-        opts.llava_model_path = (m as typeof MODELS['vision']).mmprojPath();
+    const m = MODELS[modelId];
+    const opts: any = {
+      model: m.path(),
+      n_ctx: m.nCtx,
+      n_gpu_layers: m.nGpuLayers,
+      n_threads: m.nThreads,
+    };
+
+    llamaRef.current = await initLlama(opts);
+    console.log('[Model] loaded:', modelId);
+
+    // Initialize multimodal support for vision models
+    if (m.supportsVision && 'mmprojPath' in m) {
+      try {
+        const mmprojPath = (m as typeof MODELS['vision']).mmprojPath();
+        const success = await llamaRef.current.initMultimodal({
+          path: mmprojPath,
+          use_gpu: true,
+        });
+        console.log('[Multimodal] initialized:', success ? 'success' : 'failed');
+      } catch (mmErr: any) {
+        console.warn('[Multimodal] init warning:', mmErr?.message);
+        // Don't fail completely, model might still work for text
       }
-
-      llamaRef.current = await initLlama(opts);
-      setPhase('chat');
-    } catch (e: any) {
-      setErrorMsg(e?.message ?? 'Failed to load model');
-      setPhase('error');
     }
-  };
+
+    setPhase('chat');
+  } catch (e: any) {
+    console.error('[Error] loadModel failed:', e?.message, e);
+    setErrorMsg(e?.message ?? 'Failed to load model');
+    setPhase('error');
+  }
+};
 
   // ── Switch model ──────────────────────────────────────────────────────────
 
@@ -758,23 +775,34 @@ const poll = async () => {
   // ── Send ──────────────────────────────────────────────────────────────────
   const prepareImageForInference = async (
     res: Asset,  // asset from picker result
-  ): Promise<string> => {
+  ): Promise<string | null> => {
+    if (!res.uri) return null;
     const tmpPath = `${RNFS.CachesDirectoryPath}/llava_input.jpg`;
 
-    if (res.base64) {
-      // Most reliable — write raw base64 directly, no URI schemes involved
-      await RNFS.writeFile(tmpPath, res.base64, 'base64');
-      return tmpPath;
-    }
+    try {
+      if (res.base64) {
+        // Most reliable — write raw base64 directly
+        await RNFS.writeFile(tmpPath, res.base64, 'base64');
+        console.log('[Image] prepared from base64:', tmpPath);
+        return tmpPath;
+      }
 
-    // Fallback: file:// URI (iOS typically)
-    if (res.uri?.startsWith('file://')) {
-      const srcPath = res.uri.replace(/^file:\/\//, '');
-      await RNFS.copyFile(srcPath, tmpPath);
-      return tmpPath;
-    }
+      // Fallback: file:// URI (iOS typically)
+      if (res.uri.startsWith('file://')) {
+        const srcPath = res.uri.replace(/^file:\/\//, '');
+        await RNFS.copyFile(srcPath, tmpPath);
+        console.log('[Image] prepared from URI:', tmpPath);
+        return tmpPath;
+      }
 
-    throw new Error('Could not resolve image to a file path');
+      // Try direct copy
+      await RNFS.copyFile(res.uri, tmpPath);
+      console.log('[Image] prepared from direct URI:', tmpPath);
+      return tmpPath;
+    } catch (e: any) {
+      console.error('[Image] failed to prepare:', e?.message);
+      return null;
+    }
   }
   // ─── Update sendMessage to use the fixes ─────────────────────────────────────
   const sendMessage = useCallback(async () => {
@@ -789,7 +817,8 @@ const poll = async () => {
     fullTextRef.current = '';
 
     const userMsg: Message = {
-      id: uid(), role: 'user',
+      id: uid(),
+      role: 'user',
       text: text || (imageUri ? '(image)' : ''),
       imageUri,
     };
@@ -797,23 +826,25 @@ const poll = async () => {
     const pendingMsg: Message = { id: assistantId, role: 'assistant', text: '', pending: true };
 
     setMessages(prev => [...prev, userMsg, pendingMsg]);
-    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
 
     try {
       const history = [...messages, userMsg];
 
-      // ✅ Fix 3: resolve to a real filesystem path
-      let resolvedImagePath: string | undefined;
+      // Prepare image if present
+      let resolvedImagePath: string | null = null;
       const imageAsset = pendingImageAsset.current;
-      pendingImageAsset.current = null;   // clear it alongside setPendingImage
+      pendingImageAsset.current = null;
 
       if (imageUri && imageAsset && activeModel.supportsVision) {
-        resolvedImagePath = await prepareImageForInference(imageAsset);  // ✅ actual asset object
+        resolvedImagePath = await prepareImageForInference(imageAsset);
+        if (!resolvedImagePath) {
+          throw new Error('Failed to prepare image');
+        }
       }
 
       const completionOpts: any = {
-        // ✅ Fix 1: pass currentImageUri so only this message gets <image> token
         prompt: buildPrompt(history, activeModelId, imageUri),
+        emit_partial_completion: true,
         n_predict: 1024,
         temperature: 0.7,
         top_p: 0.9,
@@ -822,10 +853,9 @@ const poll = async () => {
         stop: stopTokens(activeModelId),
       };
 
+      // Add image only if successfully prepared
       if (resolvedImagePath) {
-        completionOpts.image_path = resolvedImagePath;  // ✅ Fix 3: clean path
-        console.log('[LLaVA] image_path =', resolvedImagePath); // ✅ verify in logs
-
+        completionOpts.media_paths = [resolvedImagePath];
       }
 
       await llamaRef.current.completion(
@@ -840,10 +870,10 @@ const poll = async () => {
             updated[idx] = { id: assistantId, role: 'assistant', text: fullTextRef.current };
             return updated;
           });
-          listRef.current?.scrollToEnd({ animated: false });
         },
       );
     } catch (e: any) {
+      console.error('[Error] sendMessage failed:', e?.message, e);
       setMessages(prev => [
         ...prev.filter(m => m.id !== assistantId),
         { id: uid(), role: 'assistant', text: `⚠ ${e?.message ?? 'Generation failed'}` },
@@ -851,7 +881,7 @@ const poll = async () => {
     } finally {
       setIsGenerating(false);
     }
-  }, [input, pendingImage, isGenerating, messages, activeModelId]);
+  }, [input, pendingImage, isGenerating, messages, activeModelId, activeModel]);
   const stopGeneration = () => {
     abortRef.current = true;
     llamaRef.current?.stopCompletion();
@@ -885,7 +915,7 @@ const poll = async () => {
           <Text style={s.modelPillChevron}>⌄</Text>
         </TouchableOpacity>
 
-        <RamBadge used={ramUsed} total={ramTotal} ramFree={ramFree}/>
+        <RamBadge used={ramUsed} total={ramTotal} ramFree={ramFree} />
       </View>
 
       {/* ── Messages ── */}
@@ -900,7 +930,6 @@ const poll = async () => {
           keyExtractor={m => m.id}
           renderItem={({ item }) => <MessageBubble message={item} />}
           contentContainerStyle={s.messageList}
-          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
           ListEmptyComponent={
             <View style={s.emptyState}>
               <Text style={s.emptyIcon}>◎</Text>
