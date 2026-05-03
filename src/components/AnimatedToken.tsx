@@ -27,7 +27,7 @@ export const AnimatedToken = React.memo(({ text, style }: AnimatedTokenProps) =>
       Animated.spring(translateY, {
         toValue: 0,
         friction: 120,
-        tension: 100,
+        tension: 150,
         useNativeDriver: true,
       }),
     ]).start();

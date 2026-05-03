@@ -83,7 +83,7 @@ export default function App() {
   // ─── Scroll helpers ──────────────────────────────────────────────────────────
 
   const scrollToBottom = useCallback(() => {
-    listRef.current?.scrollToEnd({ animated: true });
+    listRef.current?.scrollToEnd({ animated: false });
   }, []);
 
   // Fires every scroll frame — keeps isAtBottomRef accurate
